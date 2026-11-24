@@ -1,0 +1,1025 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+const E = process.env;
+const PORT = E.PORT || 3000;
+const ROOT_DIR = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const INDEX_FILE = path.join(PUBLIC_DIR, 'index.html');
+const DATA_DIR = path.join(ROOT_DIR, 'data');
+fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const F = n => path.join(DATA_DIR, n);
+const rd = (n, d) => { try { return JSON.parse(fs.readFileSync(F(n), 'utf8')); } catch { return d; } };
+const wr = (n, d) => fs.writeFileSync(F(n), JSON.stringify(d, null, 2));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+app.set('trust proxy', 1);
+app.use(cors({ origin: E.CORS_ORIGIN && E.CORS_ORIGIN !== '*' ? E.CORS_ORIGIN.split(',') : true }));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: false, limit: '2mb' }));
+
+// Le HTML principal doit toujours être revalidé après un déploiement.
+// Les autres fichiers statiques peuvent être mis en cache brièvement.
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  fallthrough: true,
+  etag: true,
+  lastModified: true,
+  setHeaders(res, filePath) {
+    if (path.resolve(filePath) === path.resolve(INDEX_FILE) || /\.html?$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+    }
+  }
+}));
+
+/* ---------- utilitaires ---------- */
+const hits = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 2 * 3600000;
+  for (const [k, times] of hits) {
+    const fresh = times.filter(t => t > cutoff);
+    if (fresh.length) hits.set(k, fresh); else hits.delete(k);
+  }
+}, 15 * 60000).unref();
+const limit = (key, max, ms) => (req, res, next) => {
+  const k = key + req.ip, now = Date.now();
+  const a = (hits.get(k) || []).filter(t => now - t < ms);
+  if (a.length >= max) return res.status(429).json({ error: 'Trop de demandes, réessayez plus tard' });
+  a.push(now); hits.set(k, a); next();
+};
+const admin = (req, res, next) =>
+  E.ADMIN_KEY && req.headers['x-admin-key'] === E.ADMIN_KEY ? next() : res.status(401).json({ error: 'Non autorisé' });
+const okEmail = e => /^\S+@\S+\.\S+$/.test(e || '');
+const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const num = v => { const m = String(v ?? '').match(/\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }; // "2.5 -- 4" -> 2.5 (prix le plus bas)
+const baseUrl = req => (E.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+
+/* ---------- MARGE CACHEE (10 USD par produit) + DEVISES ---------- */
+const PROFIT_USD = Number(E.PROFIT_USD || 10);
+const CUR_BY_COUNTRY = {
+  FR:'EUR',DE:'EUR',ES:'EUR',IT:'EUR',BE:'EUR',AT:'EUR',NL:'EUR',PT:'EUR',IE:'EUR',FI:'EUR',GR:'EUR',LU:'EUR',
+  US:'USD',GB:'GBP',CA:'CAD',AU:'AUD',CH:'CHF',BR:'BRL',IN:'INR',ZA:'ZAR',MA:'MAD',DZ:'DZD',TN:'TND',EG:'EGP',
+  NG:'NGN',GH:'GHS',KE:'KES',AE:'AED',JP:'JPY',MX:'MXN',
+  CM:'XAF',GA:'XAF',CG:'XAF',TD:'XAF',CF:'XAF',GQ:'XAF',
+  SN:'XOF',CI:'XOF',BJ:'XOF',BF:'XOF',ML:'XOF',NE:'XOF',TG:'XOF',GW:'XOF'
+};
+const NO_DEC = ['XAF','XOF','JPY','KRW','UGX','RWF'];
+const curFor = c => CUR_BY_COUNTRY[String(c || '').toUpperCase()] || 'USD'; // dollar par défaut
+const curOf = q => 'USD'; // MERCADO affiche tous les prix en dollars US
+let RATES = { USD:1, EUR:.92, GBP:.78, CAD:1.37, AUD:1.5, CHF:.88, BRL:5.5, INR:84, ZAR:18, MAD:10, DZD:135, TND:3.1, EGP:48,
+  NGN:1500, GHS:15, KES:130, AED:3.67, JPY:150, MXN:18, XAF:603, XOF:603 }; // secours, remplacés par les taux du jour
+let ratesAt = 0;
+let ratesTryAt = 0; // dernière tentative (évite de retenter à chaque requête si le service de taux est lent)
+async function refreshRates() {
+  if (Date.now() - ratesAt < 12 * 3600000) return;
+  if (Date.now() - ratesTryAt < 10 * 60000) return;
+  ratesTryAt = Date.now();
+  try {
+    const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (d.result === 'success' && d.rates) {
+      RATES = { ...RATES, ...d.rates };
+      ratesAt = Date.now();
+    }
+  } catch (e) { console.error('taux (taux de secours conservés):', e.message); }
+}
+const local = (usd, cur) => Math.round(Number(usd || 0) * 100) / 100; // prix affiché en USD
+const priceCache = new Map(); // id -> prix USD (marge incluse)
+const withProfit = base => Math.round((base + PROFIT_USD) * 100) / 100;
+
+/* ---------- CJ DROPSHIPPING ---------- */
+const CJ = 'https://developers.cjdropshipping.com/api2.0/v1';
+// Le jeton est conservé sur disque : CJ n'autorise qu'un nouveau jeton toutes les 5 minutes.
+let cjTok = rd('cj-token.json', { t: '', exp: 0 });
+let cjTokenFlight = null;
+async function cjToken(force = false) {
+  if (E.CJ_ACCESS_TOKEN) return E.CJ_ACCESS_TOKEN;
+  if (!force && cjTok.t && Date.now() < cjTok.exp) return cjTok.t;
+  if (cjTokenFlight) return cjTokenFlight;
+  cjTokenFlight = (async () => {
+  if (!E.CJ_API_KEY) throw new Error('CJ_API_KEY manquante');
+  const r = await fetch(`${CJ}/authentication/getAccessToken`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey: E.CJ_API_KEY }), signal: AbortSignal.timeout(12000)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 429) cjCooldownUntil = Date.now() + 5 * 60000;
+  if (!r.ok) { cjLastError = `Auth CJ HTTP ${r.status}: ${String(d.message || d.msg || '').slice(0,150)}`; throw new Error(`CJ authentification HTTP ${r.status}`); }
+  if (!d.data?.accessToken) { cjLastError = 'Auth CJ refusée : ' + String(d.message || r.status).slice(0,150) + ' (vérifiez CJ_API_KEY dans Render)'; throw new Error('CJ token refusé : ' + (d.message || r.status)); }
+  cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 };
+  try { wr('cj-token.json', cjTok); } catch {}
+  return cjTok.t;
+  })();
+  try { return await cjTokenFlight; } finally { cjTokenFlight = null; }
+}
+// File globale CJ : une requête à la fois, avec un intervalle prudent.
+// En cas de HTTP 429, on arrête immédiatement les tentatives et on respecte Retry-After.
+let cjChain = Promise.resolve();
+let cjNextAt = 0;
+let cjCooldownUntil = 0;
+let cjLastError = '';
+let cjLastStatus = null;
+const cjFlights = new Map();
+const CJ_GAP_MS = Number(E.CJ_GAP_MS || 1100); // intervalle entre deux appels CJ
+let cjPending = 0; // nombre d'appels CJ en attente (sert à laisser la priorité aux clients)
+async function waitForCJSlot() {
+  const wait = Math.max(0, cjNextAt - Date.now(), cjCooldownUntil - Date.now());
+  if (wait) await sleep(wait);
+  cjNextAt = Date.now() + CJ_GAP_MS;
+}
+function cjGet(pathq) {
+  if (cjFlights.has(pathq)) return cjFlights.get(pathq);
+  const run = async () => {
+    let last;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await waitForCJSlot();
+      const t = await cjToken(false);
+      let response;
+      try { response = await fetch(CJ + pathq, { headers: { 'CJ-Access-Token': t }, signal: AbortSignal.timeout(18000) }); }
+      catch (e) { last = e; cjLastError = String(e.message || e).slice(0, 300); if (attempt === 0) { await sleep(3000); continue; } throw e; }
+      const d = await response.json().catch(() => ({}));
+      cjLastStatus = response.status;
+      if (response.status === 429) {
+        const header = response.headers.get('retry-after');
+        const retrySeconds = Number(header);
+        const retryDate = header && !Number.isFinite(retrySeconds) ? Date.parse(header) - Date.now() : 0;
+        const delay = Math.max(5000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
+        cjCooldownUntil = Date.now() + delay;
+        const detail = [d.code, d.message, d.msg].filter(Boolean).join(' | ');
+        cjLastError = `HTTP 429${detail ? ' — ' + detail : ''}`.slice(0, 300);
+        console.error('CJ 429 DETAILS:', { code: d.code || null, message: d.message || d.msg || null, retryAfter: header || null, cooldownSeconds: Math.ceil(delay / 1000) });
+        if (attempt < 1) continue; // waitForCJSlot() attend la pause CJ, puis on réessaie une seule fois
+        throw new Error(`CJ catalogue HTTP 429 (pause de ${Math.ceil(delay / 1000)} s)`);
+      }
+      if (response.status === 401 || response.status === 403) {
+        cjTok = { t: '', exp: 0 };
+        if (attempt === 0) continue;
+      }
+      if (!response.ok) {
+        cjLastError = `HTTP ${response.status}: ${String(d.message || d.msg || '').slice(0, 200)}`;
+        throw new Error(`CJ catalogue HTTP ${response.status}`);
+      }
+      if (d.result === false) {
+        // Codes CJ documentés : 1600201 / 16900500 = quota du compte dépassé (inutile de réessayer tout de suite).
+        if (Number(d.code) === 1600201 || Number(d.code) === 16900500) {
+          cjCooldownUntil = Date.now() + 10 * 60000;
+          cjLastError = `Quota CJ dépassé (code ${d.code}) : limite atteinte sur votre compte CJ`;
+          throw new Error('CJ quota dépassé');
+        }
+        // CJ signale parfois la limite de débit avec un HTTP 200 : on patiente puis on réessaie.
+        if (d.code === 1600200 || /too many|rate limit|frequen/i.test(String(d.message || d.msg || ''))) {
+          cjCooldownUntil = Date.now() + 5000;
+          cjLastError = 'CJ limite de débit (code ' + d.code + ')';
+          if (attempt < 2) continue;
+          throw new Error('CJ limite de débit');
+        }
+        cjLastError = `CJ result=false: ${String(d.code || '')} ${String(d.message || d.msg || '').slice(0, 200)}`;
+        if (/token|auth/i.test(d.message || d.msg || '') && attempt === 0) { cjTok = { t: '', exp: 0 }; continue; }
+        console.error('CJ listV2 refusé:', cjLastError);
+      } else { cjLastError = ''; cjLastStatus = response.status; }
+      return d;
+    }
+    throw last || new Error('CJ indisponible');
+  };
+  cjPending++;
+  const p = cjChain.then(run, run).finally(() => { cjFlights.delete(pathq); cjPending--; });
+  cjFlights.set(pathq, p);
+  cjChain = p.catch(() => {});
+  return p;
+}
+const cjUrl = id => `https://cjdropshipping.com/product/-p-${id}.html`;
+// Mots-clés CJ concrets par catégorie. Les termes marketing trop vagues
+// (ex. « stylish streetwear ») renvoyaient souvent zéro résultat.
+const CAT_TERMS = {
+  Electronics: ['bluetooth earbuds', 'wireless headphones', 'electronic accessories'],
+  Fashion: ['women clothing', 'men clothing', 'fashion accessories'],
+  Home: ['home kitchen products', 'home decor', 'kitchen accessories'],
+  Phones: ['phone case', 'mobile phone accessories', 'phone holder'],
+  Computers: ['computer accessories', 'laptop accessories', 'computer mouse keyboard'],
+  Fitness: ['fitness equipment', 'resistance bands', 'sports fitness accessories'],
+  Sports: ['sports accessories', 'outdoor sports equipment', 'camping accessories'],
+  Watches: ['wrist watch', 'quartz watch', 'smart watch'],
+  Beauty: ['beauty makeup tools', 'skincare tools', 'hair accessories'],
+  Automotive: ['car accessories', 'car interior accessories', 'car led lights'],
+  Toys: ['kids toys', 'educational toys', 'toy accessories']
+};
+const CAT_Q = Object.fromEntries(Object.entries(CAT_TERMS).map(([cat, terms]) => [cat, terms[0]]));
+// Accueil : UNE seule requête CJ au démarrage. Les autres catégories sont demandées à l'ouverture.
+const HOME_MIX = [['Electronics', 'bluetooth earbuds']];
+const CJ_MIN_USD = 1;
+const CJ_MAX_USD = 15;
+// orderBy=1 = nombre de mises en vente CJ ; desc = les plus populaires d'abord.
+const COOL = `&orderBy=1&sort=desc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
+const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche client sans plafond de prix
+const CATEGORY_SORT = '&orderBy=1&sort=desc'; // catégories : produits populaires d'abord, tous prix confondus
+
+// Élargit les recherches en français vers les termes généralement employés dans le catalogue CJ.
+// La requête originale reste toujours prioritaire ; les variantes servent à compléter les résultats.
+const SEARCH_ALIASES = [
+  [/\b(chaussure|chaussures|basket|baskets)\b/gi, 'shoes sneakers'],
+  [/\b(telephone|téléphone|smartphone|portable)\b/gi, 'phone smartphone'],
+  [/\b(ordinateur|pc|portable informatique)\b/gi, 'laptop computer'],
+  [/\b(ecouteur|écouteur|ecouteurs|écouteurs)\b/gi, 'earbuds headphones'],
+  [/\b(montre|montres)\b/gi, 'watch smart watch'],
+  [/\b(robe|robes)\b/gi, 'dress women dress'],
+  [/\b(sac|sacs|sac a main|sac à main)\b/gi, 'bag handbag'],
+  [/\b(lampe|lampes)\b/gi, 'lamp light'],
+  [/\b(led|lumiere|lumière)\b/gi, 'led light'],
+  [/\b(maison|decoration|décoration)\b/gi, 'home decor'],
+  [/\b(beaute|beauté|maquillage)\b/gi, 'beauty makeup'],
+  [/\b(telephone case|coque|coques)\b/gi, 'phone case'],
+  [/\b(football|ballon)\b/gi, 'soccer ball football'],
+  [/\b(voiture|auto|automobile)\b/gi, 'car accessories']
+];
+function searchTerms(q) {
+  const original = String(q || '').trim().replace(/\s+/g, ' ');
+  const terms = [original];
+  let translated = original;
+  for (const [pattern, replacement] of SEARCH_ALIASES) translated = translated.replace(pattern, replacement);
+  if (translated.toLowerCase() !== original.toLowerCase()) terms.push(translated);
+  // Maximum deux appels : requête originale, puis une seule variante traduite si nécessaire.
+  return [...new Set(terms.map(x => x.trim()).filter(Boolean))].slice(0, 2);
+}
+
+// Extrait la liste de produits quelle que soit la forme de la réponse CJ (content[].productList, list, records…).
+const cjList = d => {
+  const dt = d && d.data;
+  if (!dt) return [];
+  const src = Array.isArray(dt) ? dt : ['content', 'list', 'records', 'productList'].flatMap(k => Array.isArray(dt[k]) ? dt[k] : []);
+  return src.flatMap(c => c && Array.isArray(c.productList) ? c.productList : [c]).filter(c => c && typeof c === 'object');
+};
+const firstImg = v => {
+  if (Array.isArray(v)) return firstImg(v[0]);
+  if (typeof v !== 'string') return '';
+  const t = v.trim();
+  if (t.startsWith('[')) { try { return firstImg(JSON.parse(t)); } catch (_) {} }
+  const u = t.split(',')[0].trim();
+  return u.startsWith('//') ? 'https:' + u : u;
+};
+function cjFields(x) {
+  return { id: x.id || x.pid || x.productId,
+    base: num(x.nowPrice) || num(x.sellPrice) || num(x.discountPrice) || num(x.price),
+    img: firstImg(x.bigImage || x.productImage || x.productImageSet || x.image || x.imageUrl) };
+}
+function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fournisseur + marge
+  return (list || []).map((x, i) => {
+    const { id, base, img } = cjFields(x);
+    if (!id || !/^https?:\/\//i.test(img) || !(base > 0) || (!allowAnyPrice && (base < CJ_MIN_USD || base > CJ_MAX_USD))) return null;
+    const usd = withProfit(base);
+    priceCache.set(String(id), usd);
+    return { id: String(id), name: x.nameEn || x.productNameEn || x.name || x.productName || 'Produit', usd, supplierBase: base, image: img,
+      itemUrl: cjUrl(id), category: cat || '', pop: num(x.listedNum || x.listedCount || x.salesVolume), pos: i };
+  }).filter(Boolean);
+}
+const CACHE_FILE = F('cj-catalog-cache.json');
+const savedCJ = rd('cj-catalog-cache.json', { home: [], keywords: [] });
+const kwCache = new Map(Array.isArray(savedCJ.keywords) ? savedCJ.keywords : []); // cache CJ persistant
+let persistTimer = null;
+function persistCJCache() { // différé : au plus une écriture toutes les 20 s, en arrière-plan
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      const payload = JSON.stringify({ home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-60) });
+      const tmp = CACHE_FILE + '.tmp';
+      fs.writeFile(tmp, payload, err => { if (err) return console.error('cache CJ disque:', err.message); fs.rename(tmp, CACHE_FILE, () => {}); });
+    } catch (e) { console.error('cache CJ disque:', e.message); }
+  }, 20000);
+  persistTimer.unref();
+}
+async function cjItems(q, cat, size = 40, extra = '', page = 1, allowAnyPrice = false) {
+  const k = q + '|' + size + '|' + extra + '|' + page + '|' + allowAnyPrice, hit = kwCache.get(k);
+  if (hit && Date.now() - hit.at < 20 * 60000 && (hit.items.length || Date.now() < (hit.emptyUntil || 0)))
+    return hit.items.map(x => ({ ...x, category: cat || x.category }));
+  const d = await cjGet(`/product/listV2?page=${page}&size=${size}${q ? '&keyWord=' + encodeURIComponent(q) : ''}${extra}`);
+  if (d.result === false || !d.data) console.error('CJ listV2 refusé :', d.code, d.message);
+  const raw = cjList(d);
+  const items = mapCJ(raw, cat, allowAnyPrice);
+  if (raw.length && !items.length) {
+    const f = cjFields(raw[0]);
+    console.error(`CJ: ${raw.length} produits reçus pour « ${q} » mais tous écartés (image/prix). Exemple :`, JSON.stringify({ champs: Object.keys(raw[0]).slice(0, 25), id: f.id, prix: f.base, image: String(f.img).slice(0, 80) }));
+  }
+  // Mémorise aussi une réponse vide pendant 2 minutes pour éviter de marteler CJ.
+  kwCache.set(k, { at: Date.now(), items, emptyUntil: items.length ? 0 : Date.now() + 2 * 60000 });
+  persistCJCache();
+  return items;
+}
+// Accueil : prix bas (50 %) + popularité CJ (30 %) + pertinence (20 %)
+function rank(items) {
+  const n = items.length || 1, maxPop = Math.max(1, ...items.map(i => i.pop || 0));
+  const pr = new Map([...items].sort((a, b) => a.usd - b.usd).map((it, i) => [it.id, i / n]));
+  return items.map((it, i) => ({ it, s: pr.get(it.id) * .5 + (1 - (it.pop || 0) / maxPop) * .3 + (i / n) * .2 }))
+    .sort((a, b) => a.s - b.s).map(o => o.it);
+}
+// Tendance : popularité (50 %), prix (30 %), pertinence (20 %)
+function rankCool(items) {
+  const n = items.length || 1, maxPop = Math.max(1, ...items.map(i => i.pop || 0));
+  const pr = new Map([...items].sort((a, b) => a.supplierBase - b.supplierBase).map((it, i) => [it.id, i / n]));
+  // 45 % prix bas, 35 % popularité réelle, 20 % pertinence d'origine CJ
+  return items.map((it, i) => ({ it, s: pr.get(it.id) * .45 + (1 - (it.pop || 0) / maxPop) * .35 + (i / n) * .20 }))
+    .sort((a, b) => a.s - b.s).map(o => o.it);
+}
+// 1 produit de chaque catégorie à tour de rôle : le mélange reste varié du haut en bas
+function interleave(groups) {
+  const out = [], seen = new Set();
+  for (let i = 0; groups.some(g => i < g.length); i++)
+    for (const g of groups) if (g[i] && !seen.has(g[i].id)) { seen.add(g[i].id); out.push(g[i]); }
+  return out;
+}
+const present = (items, cur) => items.map(({ usd, pop, pos, px, supplierBase, ...r }) => ({ ...r, price: local(usd, cur), currency: cur, sold: 0, shipping: '' }));
+
+/* ---------- QUALITE DES IMAGES (verification legere et non bloquante) ---------- */
+const MIN_IMG = Number(E.MIN_IMG_PX || 800);
+const imgCache = new Map();
+function imgSize(b) {
+  if (!Buffer.isBuffer(b) || b.length < 24) return 0;
+  if (b[0] === 0xFF && b[1] === 0xD8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xFF) { i++; continue; }
+      const marker = b[i + 1];
+      if (marker >= 0xC0 && marker <= 0xCF && ![0xC4, 0xC8, 0xCC].includes(marker)) {
+        if (i + 8 >= b.length) return 0;
+        return Math.max(b.readUInt16BE(i + 5), b.readUInt16BE(i + 7));
+      }
+      if (i + 3 >= b.length) break;
+      const length = b.readUInt16BE(i + 2);
+      if (length < 2) break;
+      i += 2 + length;
+    }
+  }
+  if (b[0] === 0x89 && b[1] === 0x50 && b.length >= 24) {
+    return Math.max(b.readUInt32BE(16), b.readUInt32BE(20));
+  }
+  return 0;
+}
+async function imgPx(url) {
+  if (imgCache.has(url)) return imgCache.get(url);
+  let px = 0;
+  try {
+    const r = await fetch(url, { headers: { Range: 'bytes=0-65535' }, signal: AbortSignal.timeout(2500) });
+    if (r.ok || r.status === 206) px = imgSize(Buffer.from(await r.arrayBuffer()));
+  } catch (_) { /* l'image reste utilisable même si son serveur bloque Range */ }
+  if (imgCache.size > 4000) imgCache.clear();
+  imgCache.set(url, px);
+  return px;
+}
+async function sharpOnly(list, max) {
+  // La vérification des dimensions ne bloque plus le premier affichage.
+  // Les URL proviennent déjà de CJ ; leurs dimensions sont mises en cache en arrière-plan.
+  const seen = new Set();
+  const out = list.filter(x => x && x.id && !seen.has(x.id) && seen.add(x.id)).slice(0, max);
+  for (const item of out.slice(0, 12)) {
+    if (!imgCache.has(item.image)) imgPx(item.image).catch(() => {});
+  }
+  return out;
+}
+
+/* ---------- CATALOGUE CJ : CACHE FRAIS + STALE-WHILE-REVALIDATE ---------- */
+const homeCache = new Map(Array.isArray(savedCJ.home) ? savedCJ.home : []);
+const building = new Map(); // un seul rafraîchissement à la fois par catégorie
+function refreshHome(cat) {
+  const ck = cat || 'All';
+  if (building.has(ck)) return building.get(ck);
+  const p = buildHome(cat).catch(err => {
+    console.error('rafraîchissement CJ:', ck, err.message);
+    throw err;
+  }).finally(() => building.delete(ck));
+  building.set(ck, p);
+  return p;
+}
+function homeItems(cat) {
+  const ck = cat || 'All', hit = homeCache.get(ck);
+  if (hit && Date.now() - hit.at < 600000) return Promise.resolve(hit.items);
+  // Si un ancien cache CJ existe, on le sert immédiatement pendant l'actualisation.
+  if (hit && hit.items?.length) {
+    refreshHome(cat).catch(() => {});
+    return Promise.resolve(hit.items);
+  }
+  return refreshHome(cat);
+}
+async function buildHome(cat) {
+  const one = cat && cat !== 'All', ck = cat || 'All';
+  let items;
+  if (one) {
+    // Essaie les mots-clés CJ concrets de cette catégorie jusqu'à obtenir des produits.
+    // Les appels sont séquentiels : on évite de multiplier les requêtes simultanées.
+    const terms = CAT_TERMS[cat] || [cat];
+    const merged = new Map();
+    let lastErr = null;
+    for (const term of terms) {
+      try {
+        const found = await cjItems(term, cat, 48, CATEGORY_SORT, 1, true); // sans plafond de prix, comme la recherche
+        for (const it of found) if (!merged.has(it.id)) merged.set(it.id, it);
+      } catch (e) { lastErr = e; console.error('catégorie', cat, term, e.message); }
+      if (merged.size >= 12) break; // assez pour afficher : un seul appel CJ dans le cas normal (rapide)
+    }
+    if (!merged.size && lastErr) throw lastErr;
+    items = rankCool([...merged.values()]);
+  } else {
+    // Accueil volontairement limité à un seul mot-clé CJ pour réduire les HTTP 429.
+    const [c, q] = HOME_MIX[0];
+    items = rankCool(await cjItems(q, c, 24, COOL));
+  }
+  if (!items.length) throw new Error('catalogue vide (voir « CJ listV2 refusé » plus haut dans les logs)');
+  const out = await sharpOnly(items.slice(0, 90), 80);
+  homeCache.set(ck, { at: Date.now(), items: out });
+  persistCJCache();
+  return out;
+}
+const localCatalog = cur => rd('products.json', [])
+  .filter(x => x && x.id && (x.image || x.img) && /^https?:\/\//i.test(String(x.image || x.img)))
+  .map(x => {
+    const usd = withProfit(num(x.price));
+    const currency = 'USD';
+    priceCache.set(String(x.id), usd);
+    return { ...x, id: String(x.id), image: x.image || x.img, usd, price: local(usd, currency), currency };
+  }).sort((a, b) => a.usd - b.usd);
+
+function catalogLimit(value, fallback = 60, max = 80) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? Math.max(1, Math.min(max, n)) : fallback;
+}
+function sendCatalogHeaders(res) {
+  res.setHeader('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+  res.setHeader('Vary', 'Accept-Encoding');
+}
+function catalogFallback(cat, cur, max) {
+  // Ne jamais mélanger un catalogue local d'origine incertaine avec les produits CJ.
+  const stale = homeCache.get(cat || 'All');
+  return stale?.items?.length ? present(stale.items.slice(0, max), cur) : [];
+}
+app.get('/api/catalog/home', async (req, res) => {
+  const cur = curOf(req.query), cat = String(req.query.cat || 'All').slice(0, 60) || 'All';
+  const max = catalogLimit(req.query.limit, 60, 80);
+  sendCatalogHeaders(res);
+  try {
+    refreshRates().catch(() => {}); // les prix du catalogue sont en USD : on n'attend jamais les taux ici
+    // Si le catalogue n'est pas prêt après 8 s (réveil de Render, jeton CJ, limite de débit),
+    // on répond tout de suite « en préparation » : la construction continue en arrière-plan
+    // et le navigateur réessaie automatiquement.
+    const items = await Promise.race([homeItems(cat), sleep(8000).then(() => null)]);
+    if (!items) {
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(202).json({ ok: true, loading: true, currency: cur, items: [] });
+    }
+    res.json({ ok: true, source: 'cj', currency: cur, items: present(items.slice(0, max), cur) });
+  } catch (e) {
+    console.error('catalog/home:', e.message);
+    const fallback = catalogFallback(cat, cur, max);
+    if (fallback.length) return res.json({ ok: true, source: 'cj-cache', currency: cur, items: fallback, warning: 'Affichage du dernier catalogue CJ enregistré' });
+    res.status(503).json({ ok: false, error: 'Catalogue temporairement indisponible', detail: cjLastError || String(e.message).slice(0,200), currency: cur, items: [] });
+  }
+});
+app.get('/api/catalog/search', async (req, res) => {
+  const cur = curOf(req.query), q = String(req.query.q || '').trim().slice(0, 100);
+  const max = catalogLimit(req.query.limit, 60, 100);
+  const page = catalogLimit(req.query.page, 1, 10000);
+  sendCatalogHeaders(res);
+  if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [], hasMore: false, page });
+  try {
+    refreshRates().catch(() => {});
+    // La recherche part chez CJ avec les mots saisis par le client, tous prix confondus.
+    // La marge cachée de 10 USD est ajoutée par MERCADO.
+    const terms = searchTerms(q);
+    const merged = new Map();
+    let hasMore = false;
+    for (const term of terms) {
+      const found = await cjItems(term, '', max, SEARCH_SORT, page, true); // aucun plafond de prix
+      if (found.length >= max) hasMore = true;
+      for (const item of found) if (!merged.has(item.id)) merged.set(item.id, item);
+      if (merged.size >= max) break;
+    }
+    const items = [...merged.values()].slice(0, max);
+    const ranked = rankCool(items);
+    res.json({ ok: true, source: 'mercado', currency: cur, items: present(ranked, cur), page, hasMore: hasMore || merged.size >= max, expanded: terms.length > 1 });
+  } catch (e) {
+    console.error('catalog/search:', e.message);
+    res.status(503).json({ ok: false, error: 'Recherche CJ temporairement indisponible', detail: cjLastError || String(e.message).slice(0,200), currency: cur, items: [], hasMore: false, page });
+  }
+});
+
+const pickName = v => {
+  if (Array.isArray(v)) return v[0] || '';
+  if (typeof v === 'string' && v.trim().startsWith('[')) { try { return JSON.parse(v)[0] || ''; } catch (e) { /* texte simple */ } }
+  return v || '';
+};
+const imgList = v => {
+  if (Array.isArray(v)) return v.filter(Boolean);
+  if (typeof v === 'string' && v.trim().startsWith('[')) { try { return JSON.parse(v).filter(Boolean); } catch (e) { return []; } }
+  return typeof v === 'string' && v ? v.split(',').map(s => s.trim()).filter(Boolean) : [];
+};
+const detailCache = new Map();
+async function cjDetail(id) {
+  const key = String(id);
+  const cached = detailCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60000) return cached.value;
+  const d = await cjGet(`/product/query?pid=${encodeURIComponent(id)}`), p = d.data;
+  if (!p || (!p.bigImage && !p.productImage && !p.productName && !p.productNameEn)) return null;
+  const rawVariants = Array.isArray(p.variants) ? p.variants : [];
+  const variants = rawVariants.map((v, index) => {
+    // CJ peut exposer les attributs dans variantName, variantKey ou variantProperty.
+    const rawAttrs = [v.variantName, v.variantKey, v.variantProperty, v.name]
+      .filter(Boolean).map(x => typeof x === 'string' ? x : JSON.stringify(x));
+    const attrs = rawAttrs.join(' / ');
+    const parts = attrs.split(/[,;|/]+/).map(x => x.trim()).filter(Boolean);
+    const structured = {};
+    for (const source of [v.variantProperty, v.variantName, v.variantKey]) {
+      let obj = source && typeof source === 'object' ? source : null;
+      if (!obj && typeof source === 'string' && /^\s*\{/.test(source)) { try { obj = JSON.parse(source); } catch (_) {} }
+      if (obj && typeof obj === 'object') Object.assign(structured, obj);
+    }
+    const sizeField = Object.entries(structured).find(([k]) => /size|taille|尺码/i.test(k));
+    const colorField = Object.entries(structured).find(([k]) => /colou?r|couleur/i.test(k));
+    const sizeToken = '(XXXS|XXS|XXL|XXXL|XXS|XS|S|M|L|XL|[0-9]{1,3}(?:\\.[0-9])?)';
+    const sizeMatch = attrs.match(new RegExp('(?:size|taille|尺码)\\s*[:：=\\-]?\\s*' + sizeToken, 'i'))
+      || attrs.match(new RegExp('(?:^|[\\s,:;|/_-])' + sizeToken + '(?:$|[\\s,:;|/_-])', 'i'))
+      || parts.map(x => x.match(new RegExp('^(?:EU|US|UK)?\\s*' + sizeToken + '$', 'i'))).find(Boolean);
+    const size = String(sizeField?.[1] ?? (sizeMatch ? sizeMatch[1] : '')).trim();
+    const colorNames = ['black','white','red','blue','navy','green','pink','purple','violet','yellow','orange','brown','beige','grey','gray','silver','gold','khaki','wine','burgundy','multicolor','multi-color','rose','noir','blanc','rouge','bleu','vert','rose','violet','jaune','orange','marron','beige','gris'];
+    const colorMatch = attrs.match(/(?:color|colour|couleur)\s*[:：=\-]?\s*([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ -]{1,24})/i);
+    let color = String(colorField?.[1] ?? (colorMatch ? colorMatch[1].split(/[;,|/]/)[0].trim() : '')).trim();
+    if (!color) {
+      const lower = attrs.toLowerCase();
+      color = colorNames.find(c => new RegExp('(?:^|[\\s,:;|/\\-_])' + c.replace('-', '[\\s-]?') + '(?:$|[\\s,:;|/\\-_])', 'i').test(lower)) || '';
+    }
+    const basePrice = num(v.variantSellPrice) || num(v.sellPrice) || num(v.variantPrice);
+    const variantId = String(v.vid || v.variantId || v.variant_id || v.id || '');
+    return { variantId, label: [size ? `Size ${size}` : '', color ? `Color ${color}` : '', (!size && !color) ? (attrs || `Option ${index+1}`) : ''].filter(Boolean).join(' — '), size, color, base: basePrice, stock: (v.variantStock != null || v.stock != null || v.inventoryNum != null) ? num(v.variantStock ?? v.stock ?? v.inventoryNum) : null, sku: String(v.variantSku || v.sku || '').slice(0,80) };
+  }).filter(v => v.variantId && v.base > 0);
+  const validPrices = variants.map(v => v.base);
+  const base = num(p.nowPrice) || num(p.sellPrice) || (validPrices.length ? Math.min(...validPrices) : 0);
+  const images = [...imgList(p.bigImage), ...imgList(p.productImage), ...imgList(p.productImageSet)];
+  const value = {
+    id: String(id), name: pickName(p.productNameEn ?? p.productName), base, variants, images: [...new Set(images)],
+    description: String(p.description || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1500)
+  };
+  if (detailCache.size > 1000) detailCache.clear();
+  detailCache.set(key, { at: Date.now(), value });
+  return value;
+}
+app.get('/api/catalog/item', async (req, res) => {
+  const id = String(req.query.itemId || req.query.id || '').trim().slice(0, 120), cur = curOf(req.query);
+  if (!id || !/^[\w-]+$/.test(id)) return res.status(400).json({ ok: false, error: 'Identifiant produit invalide' });
+  sendCatalogHeaders(res);
+  try {
+    refreshRates().catch(() => {});
+    const loc = localCatalog(cur).find(x => x.id === id);
+    if (loc) { const { usd, ...r } = loc; return res.json({ ok: true, ...r, img: r.image, item: r }); }
+    const d = await cjDetail(id);
+    if (!d) return res.status(404).json({ error: 'Produit introuvable' });
+    const usd = priceCache.get(id) ?? (d.base > 0 ? withProfit(d.base) : null); // même prix que dans la liste
+    if (usd == null) return res.status(404).json({ error: 'Prix indisponible' });
+    priceCache.set(id, usd);
+    const item = { id, name: d.name, price: local(usd, cur), currency: cur, image: d.images[0] || '', img: d.images[0] || '',
+      images: d.images, description: d.description, itemUrl: cjUrl(id), variants: (d.variants || []).map(v => ({ variantId:v.variantId, label:v.label, size:v.size, color:v.color, stock:v.stock, price:withProfit(v.base), currency:'USD' })) };
+    res.json({ ok: true, ...item, item });
+  } catch (e) { console.error('item:', e.message); res.status(502).json({ error: 'Détail indisponible' }); }
+});
+
+/* ---------- PRODUITS SIMILAIRES ---------- */
+const STOP = new Set(['the','and','for','with','new','neuf','pour','avec','les','des','pack','lot','set','pcs','style','high','quality','free','shipping']);
+const keywords = name => String(name || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').split(/\s+/)
+  .filter(w => w.length > 2 && !STOP.has(w) && !/\d/.test(w)).slice(0, 3).join(' ');
+app.get('/api/catalog/similar', async (req, res) => {
+  const cur = curOf(req.query);
+  try {
+    refreshRates().catch(() => {});
+    const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
+    if (!q) return res.json({ ok: true, items: [] });
+    const items = rankCool((await cjItems(q, String(req.query.category || ''), 30, SEARCH_SORT, 1, true)).filter(i => i.id !== id));
+    const max = catalogLimit(req.query.limit, 8, 12);
+    res.json({ ok: true, currency: cur, items: present(await sharpOnly(items, max), cur) });
+  } catch (e) { console.error('similar:', e.message); res.json({ ok: true, items: [] }); }
+});
+
+// Diagnostic : ouvrez /api/cj-status dans le navigateur pour voir si la clé CJ fonctionne (aucun secret affiché)
+app.get('/api/cj-status', limit('cs', 8, 3600000), async (req, res) => {
+  const out = { cleCJ: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN) };
+  try {
+    await cjToken(false); out.jeton = 'ok';
+    out.catalogue = cjLastStatus ? `dernier statut HTTP ${cjLastStatus}` : 'pas encore testé';
+    out.derniereErreur = cjLastError || (cjCooldownUntil > Date.now() ? 'limitation temporaire CJ active' : 'aucune erreur récente mémorisée');
+    out.pauseCJSecondes = Math.max(0, Math.ceil((cjCooldownUntil - Date.now()) / 1000));
+  } catch (e) { out.erreur = String(e.message).slice(0, 200); }
+  res.json(out);
+});
+
+// CJ n'a pas de recherche par photo : le site masque le bouton appareil photo
+app.post('/api/visual-search', (req, res) => res.status(501).json({ error: 'Recherche par photo indisponible' }));
+
+/* ---------- TRADUCTION (DeepL ou Google) ---------- */
+const trCache = new Map();
+async function translate(texts, target) {
+  const tgt = String(target).toLowerCase();
+  if (E.DEEPL_API_KEY) {
+    const host = E.DEEPL_API_KEY.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
+    const lang = { en: 'EN-US', pt: 'PT-PT', zh: 'ZH' }[tgt] || tgt.toUpperCase(), out = [];
+    for (let i = 0; i < texts.length; i += 40) {
+      const r = await fetch(`https://${host}/v2/translate`, {
+        method: 'POST', headers: { Authorization: `DeepL-Auth-Key ${E.DEEPL_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: texts.slice(i, i + 40), target_lang: lang, source_lang: 'FR', tag_handling: 'html' })
+      });
+      const d = await r.json();
+      if (!d.translations) throw new Error('DeepL');
+      out.push(...d.translations.map(x => x.text));
+    }
+    return out;
+  }
+  if (E.GOOGLE_TRANSLATE_API_KEY) {
+    const r = await fetch('https://translation.googleapis.com/language/translate/v2?key=' + E.GOOGLE_TRANSLATE_API_KEY, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: texts, target: tgt, source: 'fr', format: 'html' })
+    });
+    const d = await r.json();
+    if (!d.data) throw new Error('Google');
+    return d.data.translations.map(x => x.translatedText);
+  }
+  throw new Error('Aucune clé de traduction');
+}
+app.post('/api/translate', limit('tr', 30, 3600000), async (req, res) => {
+  try {
+    const texts = (req.body.texts || []).map(String).slice(0, 400), target = String(req.body.target || '').slice(0, 8);
+    const key = target + crypto.createHash('md5').update(texts.join('|')).digest('hex');
+    if (!trCache.has(key)) trCache.set(key, await translate(texts, target));
+    res.json({ translations: trCache.get(key) });
+  } catch (e) { res.status(503).json({ error: 'Traduction indisponible' }); }
+});
+
+/* ---------- TELEGRAM ORDER NOTIFICATIONS ---------- */
+async function telegram(text) {
+  if (!E.TELEGRAM_BOT_TOKEN || !E.TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${E.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: E.TELEGRAM_CHAT_ID, text: String(text).slice(0, 4000) })
+    });
+  } catch (e) { console.error('Telegram:', e.message); }
+}
+
+/* ---------- EMAIL (optionnel) ----------
+   Le code d'origine appelait sendMail() sans la définir (ReferenceError dans les rappels et alertes).
+   Sans RESEND_API_KEY + MAIL_FROM, aucun email n'est envoyé et rien ne plante. */
+const MAIL_ON = !!(E.RESEND_API_KEY && E.MAIL_FROM);
+async function sendMail(to, subject, text, html) {
+  if (!MAIL_ON) return false;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${E.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: E.MAIL_FROM, to: [to], subject, text, ...(html ? { html } : {}) }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!r.ok) console.error('mail HTTP', r.status);
+    return r.ok;
+  } catch (e) { console.error('mail:', e.message); return false; }
+}
+
+/* ---------- COMMANDES ---------- */
+async function refreshPrice(id, variantId = '') {
+  const loc = localCatalog().find(x => x.id === String(id));
+  if (loc && !variantId) return loc.usd;
+  try {
+    const d = await cjDetail(id);
+    if (d && variantId) { const v = (d.variants || []).find(x => x.variantId === String(variantId)); return v ? withProfit(v.base) : null; }
+    if (d && d.base > 0) { const p = withProfit(d.base); priceCache.set(String(id), p); return p; }
+  } catch (e) { console.error('refreshPrice:', e.message); }
+  return null;
+}
+async function serverTotal(items) { // total USD marge incluse : le prix vient du serveur, jamais du navigateur
+  let t = 0;
+  for (const i of items || []) {
+    const id = String(i.id);
+    let p = null;
+    if (i.variantId) {
+      p = await refreshPrice(id, i.variantId);
+      // Variante introuvable (CJ momentanément indisponible, identifiant différent) : on ne bloque pas
+      // l'achat, on retombe sur le prix de liste du produit.
+      if (p == null) p = priceCache.get(id) ?? await refreshPrice(id, '');
+    } else {
+      // Aucune variante précisée (ajout depuis la liste, chargement lent) : on ne bloque pas non plus.
+      // Prix = prix de liste (le plus bas) ; la commande indique la variante choisie, sinon le support la confirme.
+      try {
+        const detail = await cjDetail(id);
+        p = detail && detail.base > 0 ? withProfit(detail.base) : priceCache.get(id);
+      } catch (_) { p = priceCache.get(id); }
+      if (p == null) p = await refreshPrice(id, '');
+    }
+    if (p == null) return null;
+    t += p * Math.max(1, Math.min(99, Number(i.qty) || 1));
+  }
+  return t > 0 ? t : null;
+}
+const FIELDS = ['name', 'email', 'phone', 'phone2', 'address', 'quarter', 'landmark', 'city', 'region', 'zip', 'country', 'notes'];
+const cleanCustomer = c => Object.fromEntries(FIELDS.map(k => [k, String((c || {})[k] ?? '').trim().slice(0, 250)]));
+const cleanId = v => String(v || '').replace(/[^\w-]/g, '').slice(0, 40) || `MC-${Date.now()}`;
+
+function orderText(o, head) {
+  const c = o.customer;
+  return `${head} ${o.orderId}\n👤 ${c.name} | ${c.phone}${c.phone2 ? ' / ' + c.phone2 : ''} | ${c.email}\n` +
+    `📍 ${c.address}${c.quarter ? ', ' + c.quarter : ''}${c.landmark ? ' (près de ' + c.landmark + ')' : ''}\n${c.city}, ${c.region} ${c.zip} ${c.country}\n` +
+    (c.notes ? `📝 ${c.notes}\n` : '') +
+    o.items.map(i => `• ${i.name}${i.variantName ? ' — ' + i.variantName : ''} x${i.qty}\n  CJ pid: ${i.id}${i.variantId ? ' | variant: ' + i.variantId : ''}\n  ${i.itemUrl}`).join('\n') +
+    `\n💰 Total $${o.total.toFixed(2)} (dont marge $${o.profitUsd.toFixed(2)})`;
+}
+app.post('/api/order', limit('od', 30, 3600000), async (req, res) => {
+  try {
+    const b = req.body || {}, pay = rd('payments.json', {})[cleanId(b.orderId)];
+    await refreshRates();
+    const items = (b.items || []).slice(0, 50).map(i => ({ id: String(i.id), name: String(i.name || '').slice(0, 200), qty: Math.max(1, Math.min(99, Number(i.qty) || 1)), requiresVariant: !!i.requiresVariant, variantId: String(i.variantId || '').slice(0,100), variantName: String(i.variantName || '').slice(0,120), itemUrl: cjUrl(i.id) }));
+    if (!items.length) return res.status(400).json({ ok:false, error:'Le panier est vide.' });
+    const verifiedTotal = await serverTotal(items);
+    if (!verifiedTotal) return res.status(400).json({ ok:false, error:'Choisissez une taille ou une variante valide pour chaque produit avant de commander.' });
+    const order = {
+      orderId: cleanId(b.orderId), customer: cleanCustomer(b.customer), items,
+      total: verifiedTotal, profitUsd: PROFIT_USD * items.reduce((n, i) => n + i.qty, 0),
+      status: pay?.paid ? 'paid' : 'pending', createdAt: new Date().toISOString()
+    };
+    const orders = rd('orders.json', []);
+    if (!orders.some(o => o.orderId === order.orderId)) {
+      orders.push(order); wr('orders.json', orders);
+      telegram(orderText(order, order.status === 'paid' ? '✅ Commande PAYÉE' : '🛒 Nouvelle commande (en attente de paiement)'));
+    }
+    res.json({ ok: true, orderId: order.orderId });
+  } catch (e) { console.error('order:', e); res.status(500).json({ error: 'Commande impossible' }); }
+});
+
+/* ---------- CAMERPAY (Orange Money, MTN MoMo, cartes et PayPal) ---------- */
+const CAMERPAY_API = 'https://camerpay.biz/api';
+const CAMERPAY_TOKEN = String(E.CAMERPAY_TOKEN || '').trim();
+const CAMERPAY_CALLBACK_SECRET = String(E.CAMERPAY_CALLBACK_SECRET || '').trim();
+const toPay = usd => Math.round(usd * (RATES.XAF || 603));
+const cmPhone = p => {
+  const d = String(p || '').replace(/\D/g, '');
+  if (/^237[62]\d{8}$/.test(d)) return '+' + d;
+  if (/^[62]\d{8}$/.test(d)) return '+237' + d;
+  return '';
+};
+const camerpPayHeaders = () => ({ 'Content-Type': 'application/json', Authorization: `Bearer ${CAMERPAY_TOKEN}` });
+
+app.post('/api/payment/camerpay', limit('camerpay', 20, 3600000), async (req, res) => {
+  try {
+    if (!CAMERPAY_TOKEN) return res.status(503).json({ error: 'CamerPay non configuré : ajoutez CAMERPAY_TOKEN dans Render.' });
+    const o = req.body || {}, c = cleanCustomer(o.customer), orderId = cleanId(o.orderId);
+    if (!okEmail(c.email)) return res.status(400).json({ error: 'Une adresse email valide est obligatoire.' });
+    if (!c.name || !c.phone || !c.address || !c.city) return res.status(400).json({ error: 'Nom, téléphone, adresse et ville obligatoires.' });
+    await refreshRates();
+    const usd = await serverTotal(o.items);
+    if (!usd) return res.status(400).json({ error: 'Panier invalide : rechargez la page.' });
+    const amount = toPay(usd);
+    // Ne pas envoyer payment_method : CamerPay laisse le client choisir parmi les méthodes activées,
+    // notamment Orange Money, MTN MoMo, Visa/Mastercard et PayPal.
+    const body = {
+      amount, currency: 'XAF',
+      customer_phone: cmPhone(c.phone) || c.phone,
+      customer_email: c.email,
+      customer_name: c.name,
+      merchant_invoice_id: orderId,
+      merchant_callback_url: `${baseUrl(req)}/api/payment/camerpay/webhook`,
+      merchant_return_url: `${baseUrl(req)}/?order=${encodeURIComponent(orderId)}#confirm`,
+      source: 'mercado_checkout',
+      idempotency_key: `mercado-${orderId}`,
+      ...(E.CAMERPAY_METHOD ? { payment_method: E.CAMERPAY_METHOD } : {}) // optionnel : orange_money, mtn_momo… (sinon le client choisit)
+    };
+    const r = await fetch(`${CAMERPAY_API}/payment/initiate`, {
+      method: 'POST', headers: camerpPayHeaders(), body: JSON.stringify(body)
+    });
+    const d = await r.json().catch(() => ({}));
+    const tx = d.transaction && typeof d.transaction === 'object' ? d.transaction : {};
+    const paymentUrl = d.pay_url || d.redirect_url || d.payment_url || tx.pay_url || tx.redirect_url || tx.payment_url;
+    const txUuid = d.transaction_uuid || d.uuid || tx.uuid || tx.transaction_uuid || '';
+    if (!r.ok || d.success === false || !paymentUrl) {
+      console.error('CamerPay initiate:', r.status, JSON.stringify(d).slice(0, 600));
+      // Message le plus précis possible : message CamerPay, première erreur de champ, ou action à faire (ex. KYC, HTTP 402).
+      const fieldErr = d.errors && typeof d.errors === 'object' ? Object.values(d.errors).flat()[0] : '';
+      const msg = [...new Set([d.message || d.error, fieldErr, d.next_action].filter(Boolean))].join(' — ')
+        || (r.status === 401 ? 'Jeton CamerPay invalide (vérifiez CAMERPAY_TOKEN dans Render).' : `CamerPay n’a pas pu créer le paiement (HTTP ${r.status}).`);
+      return res.status(r.status >= 400 && r.status < 500 ? r.status : 502).json({
+        error: msg, code: d.failure_code || d.code || null, upgrade_url: d.upgrade_url || null
+      });
+    }
+    const pays = rd('payments.json', {});
+    pays[orderId] = { provider: 'CamerPay', uuid: txUuid, amount, usd, status: d.status || tx.status || 'pending', at: Date.now(), paid: false };
+    wr('payments.json', pays);
+    res.json({ ok: true, payment_url: paymentUrl, orderId, amount, currency: 'XAF', transaction_uuid: txUuid });
+  } catch (e) {
+    console.error('CamerPay initiate:', e.message);
+    res.status(502).json({ error: 'Paiement CamerPay indisponible. Réessayez plus tard.' });
+  }
+});
+
+async function camerpPayStatus(uuid) {
+  if (!CAMERPAY_TOKEN) throw new Error('CAMERPAY_TOKEN manquant');
+  const r = await fetch(`${CAMERPAY_API}/payment/${encodeURIComponent(uuid)}/status`, { headers: { Authorization: `Bearer ${CAMERPAY_TOKEN}` } });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.success === false) throw new Error(d.message || 'Impossible de vérifier le paiement CamerPay');
+  const tx = d.transaction && typeof d.transaction === 'object' ? d.transaction : d;
+  return { status: tx.status ?? d.status, amount: tx.amount ?? d.amount, paid_at: tx.paid_at ?? d.paid_at };
+}
+async function settleCamerPay(orderId) {
+  const pays = rd('payments.json', {}), p = pays[orderId];
+  if (!p || !p.uuid) return false;
+  if (p.paid) return true;
+  const status = await camerpPayStatus(p.uuid);
+  if (String(status.status).toLowerCase() !== 'completed' || Number(status.amount) + 0.01 < p.amount) return false;
+  p.paid = true; p.status = 'completed'; p.paidAt = status.paid_at || new Date().toISOString();
+  wr('payments.json', pays);
+  const orders = rd('orders.json', []), o = orders.find(x => x.orderId === orderId);
+  if (o && o.status !== 'paid') {
+    o.status = 'paid'; o.paidAt = p.paidAt; wr('orders.json', orders);
+    telegram(orderText(o, '✅ PAYÉ CamerPay ' + p.amount + ' XAF —'));
+  }
+  return true;
+}
+app.post('/api/payment/camerpay/webhook', async (req, res) => {
+  try {
+    if (!CAMERPAY_CALLBACK_SECRET) return res.status(503).send('Webhook secret not configured');
+    const b = req.body || {};
+    const uuid = String(b.uuid || ''), invoiceId = String(b.invoice_id || ''), status = String(b.status || '').toLowerCase(), amount = String(b.amount || '');
+    const signature = String(req.get('X-CamerPay-Signature') || b.signature || '');
+    const payload = `${uuid}|${invoiceId}|${status}|${amount}`;
+    const expected = crypto.createHmac('sha256', CAMERPAY_CALLBACK_SECRET).update(payload).digest('hex');
+    const aa = Buffer.from(expected), bb = Buffer.from(signature);
+    if (!signature || aa.length !== bb.length || !crypto.timingSafeEqual(aa, bb)) return res.status(401).send('Invalid signature');
+    const pays = rd('payments.json', {}), p = pays[invoiceId];
+    if (!p || p.uuid !== uuid || Number(amount) + 0.01 < p.amount) return res.status(400).send('Unknown transaction');
+    if (status === 'completed') await settleCamerPay(invoiceId);
+    else if (['failed', 'cancelled', 'refunded'].includes(status)) { p.status = status; wr('payments.json', pays); }
+    return res.status(200).send('OK');
+  } catch (e) { console.error('CamerPay webhook:', e.message); return res.status(500).send('Webhook processing error'); }
+});
+
+// Diagnostic : ouvrez /api/camerpay-status dans le navigateur. Aucun secret affiché, aucun paiement créé.
+app.get('/api/camerpay-status', limit('cps', 10, 3600000), async (req, res) => {
+  const out = { jetonConfigure: !!CAMERPAY_TOKEN, secretWebhookConfigure: !!CAMERPAY_CALLBACK_SECRET,
+    urlSite: E.PUBLIC_BASE_URL || baseUrl(req) + ' (PUBLIC_BASE_URL non défini : adresse déduite)', methodeImposee: E.CAMERPAY_METHOD || 'aucune (le client choisit)' };
+  if (!CAMERPAY_TOKEN) { out.verdict = 'CAMERPAY_TOKEN absent dans Render.'; return res.json(out); }
+  try {
+    const r = await fetch(`${CAMERPAY_API}/payment/00000000-0000-0000-0000-000000000000/status`,
+      { headers: { Authorization: `Bearer ${CAMERPAY_TOKEN}` }, signal: AbortSignal.timeout(10000) });
+    out.reponseCamerPay = `HTTP ${r.status}`;
+    out.verdict = r.status === 401 || r.status === 403 ? 'Jeton REFUSÉ par CamerPay : mauvais jeton, révoqué, ou jeton de démo.'
+      : r.status === 404 || r.status === 422 ? 'Jeton ACCEPTÉ par CamerPay (le paiement test inexistant renvoie bien une erreur normale).'
+      : r.status >= 500 ? 'CamerPay a une panne ou une erreur de son côté, réessayez plus tard.' : 'Réponse inattendue, voir reponseCamerPay.';
+  } catch (e) { out.verdict = 'CamerPay injoignable depuis le serveur : ' + String(e.message).slice(0, 120); }
+  res.json(out);
+});
+
+app.get('/api/order/status', limit('os', 90, 3600000), async (req, res) => {
+  try {
+    const id = cleanId(req.query.orderId);
+    let o = rd('orders.json', []).find(x => x.orderId === id);
+    if (o && o.status === 'pending') { await settleCamerPay(id).catch(() => {}); o = rd('orders.json', []).find(x => x.orderId === id); }
+    res.json({ ok: true, status: o ? o.status : 'unknown' });
+  } catch (e) { res.json({ ok: true, status: 'unknown' }); }
+});
+
+/* ---------- AVIS (format exact attendu par le site) ---------- */
+app.get('/api/reviews', (req, res) => {
+  const pid = String(req.query.productId || '');
+  res.json({ ok: true, reviews: rd('reviews.json', []).filter(r => r.productId === pid).slice(-50).reverse().map(({ productId, ...r }) => r) });
+});
+app.post('/api/reviews', limit('rv', 10, 3600000), (req, res) => {
+  const b = req.body || {}, pid = String(b.productId || '').slice(0, 100), text = String(b.text || '').trim().slice(0, 1000);
+  if (!pid || !text) return res.status(400).json({ error: 'Avis incomplet' });
+  const name = String(b.name || 'Client').slice(0, 40), all = rd('reviews.json', []);
+  all.push({ productId: pid, name, initial: name[0]?.toUpperCase() || 'C', stars: Math.max(1, Math.min(5, Number(b.stars) || 5)),
+    date: new Date().toLocaleDateString('fr-FR'), text, variant: String(b.variant || '').slice(0, 60) });
+  wr('reviews.json', all.slice(-3000));
+  res.json({ ok: true });
+});
+
+/* ---------- PRODUIT CONSULTE -> RAPPEL EMAIL ---------- */
+app.post('/api/track-view', limit('tv', 120, 3600000), (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase(), p = req.body.product || {};
+  if (!okEmail(email) || !p.id) return res.json({ ok: true });
+  const v = rd('views.json', []);
+  if (!v.some(x => x.email === email && x.product.id === p.id))
+    v.push({ email, at: Date.now(), reminded: false, product: { id: p.id, name: String(p.name || '').slice(0, 150), price: p.price, img: p.img } });
+  wr('views.json', v.slice(-5000));
+  res.json({ ok: true });
+});
+async function runReminders() {
+  if (!MAIL_ON) return 0; // pas de service d'email configuré : on ne marque rien comme « rappelé »
+  const delay = Number(E.REMINDER_DELAY_HOURS || 24) * 3600000, base = E.PUBLIC_BASE_URL || '';
+  const v = rd('views.json', []), orders = rd('orders.json', []);
+  let sent = 0;
+  for (const x of v) {
+    if (x.reminded || Date.now() - x.at < delay) continue;
+    x.reminded = true;
+    if (orders.some(o => (o.customer?.email || '').toLowerCase() === x.email && new Date(o.createdAt) > x.at)) continue;
+    const p = x.product;
+    const html = `<div style="font-family:Arial;max-width:420px"><h2>Vous avez consulté ce produit</h2>${p.img ? `<img src="${esc(p.img)}" width="300" alt="">` : ''}<p>${esc(p.name)}</p><a href="${esc(base)}" style="background:#FF6B00;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Revoir le produit</a></div>`;
+    if (await sendMail(x.email, 'Vous avez récemment consulté ce produit', `${p.name} : ${base}`, html)) sent++;
+  }
+  wr('views.json', v);
+  return sent;
+}
+setInterval(() => runReminders().catch(e => console.error('reminders:', e.message)), 30 * 60000);
+app.post('/api/admin/run-reminders', admin, async (req, res) => res.json({ ok: true, sent: await runReminders() }));
+
+/* ---------- ALERTES "PRODUIT DISPONIBLE" ---------- */
+app.post('/api/notify/subscribe', limit('ns', 10, 3600000), (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase(), q = String(req.body.query || '').slice(0, 100).trim();
+  if (!okEmail(email) || !q) return res.status(400).json({ error: 'Email ou recherche invalide' });
+  const s = rd('subs.json', []);
+  if (!s.some(x => x.email === email && x.query === q)) { s.push({ email, query: q, at: Date.now() }); wr('subs.json', s.slice(-5000)); }
+  telegram(`🔔 Alerte demandée : "${q}" (${email})`);
+  res.json({ ok: true });
+});
+app.post('/api/admin/notify-broadcast', admin, async (req, res) => {
+  const subs = rd('subs.json', []), keep = [], seen = new Map();
+  let sent = 0;
+  for (const s of subs) {
+    if (!seen.has(s.query)) { try { seen.set(s.query, (await cjItems(s.query, '', 5))[0] || null); } catch (e) { seen.set(s.query, null); } }
+    const hit = seen.get(s.query);
+    if (hit && await sendMail(s.email, `"${s.query}" est disponible sur MERCADO`, `Bonne nouvelle : ${hit.name} est disponible. ${E.PUBLIC_BASE_URL || ''}`)) sent++;
+    else keep.push(s);
+  }
+  wr('subs.json', keep);
+  res.json({ ok: true, sent });
+});
+app.get('/api/admin/orders', admin, (req, res) => res.json({ ok: true, orders: rd('orders.json', []).slice(-200).reverse() }));
+
+/* ---------- IA ---------- */
+app.post('/api/ai', limit('ai', 40, 3600000), async (req, res) => {
+  if (!E.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'IA non configurée' });
+  try {
+    const b = req.body || {};
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: E.ANTHROPIC_MODEL || 'claude-sonnet-5-5', max_tokens: 600,
+        system: "Tu es MERCADO AI, l'assistant d'une boutique en ligne. Paiement : Mobile Money (MTN, Orange), carte bancaire ou PayPal via CamerPay. Réponds brièvement, dans la langue du client. Produit ouvert : " + JSON.stringify(b.product || null).slice(0, 800),
+        messages: (b.history || []).slice(-10).filter(m => m && m.content).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 2000) }))
+      })
+    });
+    const answer = (await r.json()).content?.[0]?.text;
+    answer ? res.json({ answer }) : res.status(502).json({ error: 'Pas de réponse' });
+  } catch (e) { res.status(502).json({ error: 'IA indisponible' }); }
+});
+app.post('/api/ai-log', limit('al', 60, 3600000), (req, res) => {
+  const q = String(req.body.question || '').slice(0, 300);
+  if (q) telegram(`💬 Question MERCADO AI : ${q}${req.body.product?.name ? `\n(produit : ${req.body.product.name})` : ''}`);
+  res.json({ ok: true });
+});
+
+app.get('/api/cj-debug', limit('cd', 10, 3600000), async (req, res) => {
+  try {
+    const d = await cjGet('/product/listV2?page=1&size=5&keyWord=phone%20case');
+    const list = cjList(d);
+    const f = list[0] ? cjFields(list[0]) : null;
+    res.json({ result: d.result, code: d.code, message: d.message, nombreProduits: list.length,
+      apresFiltreMERCADO: mapCJ(list, '', true).length,
+      champsLusPremierProduit: f ? { id: f.id || 'MANQUANT', prix: f.base || 'MANQUANT', image: f.img ? f.img.slice(0, 70) : 'MANQUANTE' } : null,
+      champsDisponibles: list[0] ? Object.keys(list[0]) : [],
+      derniereErreur: cjLastError,
+      pauseSecondes: Math.max(0, Math.ceil((cjCooldownUntil - Date.now()) / 1000)) });
+  } catch (e) { res.json({ erreur: String(e.message), derniereErreur: cjLastError }); }
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString(),
+  config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), camerpPay: !!E.CAMERPAY_TOKEN, camerpPayWebhook: !!E.CAMERPAY_CALLBACK_SECRET, telegram: !!E.TELEGRAM_BOT_TOKEN, mail: MAIL_ON } }));
+// Une route API inconnue doit rester une erreur JSON, jamais renvoyer index.html.
+app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Route API introuvable' }));
+
+// Fallback SPA : uniquement pour les navigations HTML. Les fichiers manquants
+// (images, scripts, feuilles de style) conservent une vraie réponse 404.
+app.get(/.*/, (req, res, next) => {
+  if (!req.accepts('html') || req.method !== 'GET' || path.extname(req.path)) return next();
+  if (!fs.existsSync(INDEX_FILE)) return res.status(500).send('Fichier public/index.html introuvable');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(INDEX_FILE, err => { if (err) next(err); });
+});
+app.use((req, res) => res.status(404).type('text').send('Not found'));
+app.use((e, req, res, next) => {
+  console.error('Erreur serveur:', e);
+  if (res.headersSent) return next(e);
+  res.status(500).json({ ok: false, error: 'Erreur interne' });
+});
+
+if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settleCamerPay, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
+else app.listen(PORT, '0.0.0.0', () => {
+  console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
+  // Préchargement : accueil d'abord, puis les autres catégories une par une en arrière-plan.
+  // Les requêtes des clients restent prioritaires (on attend que la file CJ soit libre).
+  cjToken(false).catch(() => {}); // jeton prêt avant la première visite
+  setTimeout(async () => {
+    try { await homeItems('All'); } catch (e) { console.error('préchargement:', e.message); }
+    if (E.CJ_PREWARM === '0') return;
+    await sleep(45000); // laisse passer les premiers visiteurs avant de lancer les autres catégories
+    for (const cat of Object.keys(CAT_TERMS)) {
+      while (cjPending > 0) await sleep(2000);
+      try { await homeItems(cat); } catch (e) { console.error('préchargement', cat, e.message); }
+      await sleep(3000);
+    }
+  }, 5000);
+});
