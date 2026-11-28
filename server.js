@@ -218,9 +218,13 @@ const HOME_MIX = [['Electronics', 'bluetooth earbuds']];
 const CJ_MIN_USD = 1;
 const CJ_MAX_USD = 15;
 // orderBy=1 = nombre de mises en vente CJ ; desc = les plus populaires d'abord.
-const COOL = `&orderBy=1&sort=desc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
-const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche client sans plafond de prix
-const CATEGORY_SORT = '&orderBy=1&sort=desc'; // catégories : produits populaires d'abord, tous prix confondus
+// Livraison gratuite uniquement (addMarkStatus=1 chez CJ) : un transport payant mange la marge et gonfle le coût.
+// FREE_SHIPPING_ONLY=0 dans Render désactive ce filtre.
+const FREE_ONLY = E.FREE_SHIPPING_ONLY !== '0';
+const FREE = FREE_ONLY ? '&addMarkStatus=1' : '';
+const COOL = `&orderBy=1&sort=desc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}${FREE}`; // filtre économique réservé à la sélection de l'accueil
+const SEARCH_SORT = '&orderBy=1&sort=desc' + FREE; // recherche client : sans plafond de prix, livraison gratuite
+const CATEGORY_SORT = '&orderBy=1&sort=desc' + FREE; // catégories : populaires d'abord, tous prix, livraison gratuite
 
 // Élargit les recherches en français vers les termes généralement employés dans le catalogue CJ.
 // La requête originale reste toujours prioritaire ; les variantes servent à compléter les résultats.
@@ -273,6 +277,7 @@ function cjFields(x) {
 function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fournisseur + marge
   return (list || []).map((x, i) => {
     const { id, base, img } = cjFields(x);
+    if (FREE_ONLY && Number(x.addMarkStatus) === 0) return null; // livraison payante : écarté
     if (!id || !/^https?:\/\//i.test(img) || !(base > 0) || (!allowAnyPrice && (base < CJ_MIN_USD || base > CJ_MAX_USD))) return null;
     const usd = withProfit(base);
     priceCache.set(String(id), usd);
@@ -281,7 +286,9 @@ function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fourn
   }).filter(Boolean);
 }
 const CACHE_FILE = F('cj-catalog-cache.json');
-const savedCJ = rd('cj-catalog-cache.json', { home: [], keywords: [] });
+const CACHE_VERSION = 2;
+const savedRaw = rd('cj-catalog-cache.json', { home: [], keywords: [] });
+const savedCJ = savedRaw && savedRaw.v === CACHE_VERSION ? savedRaw : { home: [], keywords: [] };
 const kwCache = new Map(Array.isArray(savedCJ.keywords) ? savedCJ.keywords : []); // cache CJ persistant
 let persistTimer = null;
 function persistCJCache() { // différé : au plus une écriture toutes les 20 s, en arrière-plan
@@ -289,7 +296,7 @@ function persistCJCache() { // différé : au plus une écriture toutes les 20 s
   persistTimer = setTimeout(() => {
     persistTimer = null;
     try {
-      const payload = JSON.stringify({ home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-60) });
+      const payload = JSON.stringify({ v: CACHE_VERSION, home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-60) });
       const tmp = CACHE_FILE + '.tmp';
       fs.writeFile(tmp, payload, err => { if (err) return console.error('cache CJ disque:', err.message); fs.rename(tmp, CACHE_FILE, () => {}); });
     } catch (e) { console.error('cache CJ disque:', e.message); }
@@ -939,7 +946,7 @@ app.post('/api/admin/notify-broadcast', admin, async (req, res) => {
   const subs = rd('subs.json', []), keep = [], seen = new Map();
   let sent = 0;
   for (const s of subs) {
-    if (!seen.has(s.query)) { try { seen.set(s.query, (await cjItems(s.query, '', 5))[0] || null); } catch (e) { seen.set(s.query, null); } }
+    if (!seen.has(s.query)) { try { seen.set(s.query, (await cjItems(s.query, '', 20, SEARCH_SORT, 1, true))[0] || null); } catch (e) { seen.set(s.query, null); } }
     const hit = seen.get(s.query);
     if (hit && await sendMail(s.email, `"${s.query}" est disponible sur MERCADO`, `Bonne nouvelle : ${hit.name} est disponible. ${E.PUBLIC_BASE_URL || ''}`)) sent++;
     else keep.push(s);
@@ -979,6 +986,8 @@ app.get('/api/cj-debug', limit('cd', 10, 3600000), async (req, res) => {
     const f = list[0] ? cjFields(list[0]) : null;
     res.json({ result: d.result, code: d.code, message: d.message, nombreProduits: list.length,
       apresFiltreMERCADO: mapCJ(list, '', true).length,
+      livraisonGratuiteActive: FREE_ONLY,
+      produitsLivraisonGratuite: list.filter(x => Number(x.addMarkStatus) === 1).length,
       champsLusPremierProduit: f ? { id: f.id || 'MANQUANT', prix: f.base || 'MANQUANT', image: f.img ? f.img.slice(0, 70) : 'MANQUANTE' } : null,
       champsDisponibles: list[0] ? Object.keys(list[0]) : [],
       derniereErreur: cjLastError,
